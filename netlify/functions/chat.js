@@ -20,7 +20,7 @@ const json = (statusCode, body) => ({
 
 exports.handler = async (event) => {
   if (event.httpMethod !== "POST") return json(405, { error: "Use POST.", code: "method" });
-  const key = process.env.GEMINI_API_KEY;
+  const key = (process.env.GEMINI_API_KEY || "").trim();
   if (!key) return json(500, { error: "Server is missing GEMINI_API_KEY.", code: "no_key" });
 
   let data;
@@ -45,8 +45,10 @@ exports.handler = async (event) => {
     });
     const out = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const code = res.status === 429 ? "rate_limit" : "upstream";
-      return json(502, { error: res.status === 429 ? "Free limit reached. Try again in a minute." : "AI service error.", code });
+      const msg = (out.error && out.error.message) || "";
+      console.log("Gemini error", res.status, msg);
+      if (res.status === 429) return json(502, { error: "Free limit reached. Try again in a minute.", code: "rate_limit" });
+      return json(502, { error: "AI service error (" + res.status + "): " + msg.slice(0, 200), code: "upstream" });
     }
     const cand = out.candidates && out.candidates[0];
     const reply = cand && cand.content && cand.content.parts ? cand.content.parts.map((p) => p.text || "").join("").trim() : "";
