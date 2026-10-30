@@ -1,4 +1,9 @@
-const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const PRIMARY = (process.env.GEMINI_MODEL || "gemini-2.5-flash").trim();
+// Tried in order. If the primary model is busy or unavailable, the next one is used.
+const MODELS = [...new Set([PRIMARY, "gemini-3.6-flash", "gemini-3.5-flash-lite"])];
+// Netlify functions time out at ~10s by default, so all retries must fit inside this budget.
+const BUDGET_MS = 8500;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const BASE = `You are SAARTHI AI, a free assistant whose mission is "Less Confusion. More Clarity. Real Solutions."
 - Reply in the language the user writes in (Hindi, English or Hinglish), in simple words.
@@ -25,36 +30,4 @@ exports.handler = async (event) => {
 
   let data;
   try { data = JSON.parse(event.body || "{}"); } catch { return json(400, { error: "Invalid request.", code: "bad_json" }); }
-
-  const msgs = Array.isArray(data.messages) ? data.messages.slice(-20) : [];
-  const contents = msgs
-    .filter((m) => m && (m.role === "user" || m.role === "model") && typeof m.text === "string" && m.text.trim())
-    .map((m) => ({ role: m.role, parts: [{ text: m.text.slice(0, 4000) }] }));
-  if (!contents.length || contents[contents.length - 1].role !== "user")
-    return json(400, { error: "Send a message first.", code: "empty" });
-
-  try {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": key },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: BASE + (data.solution ? SOLUTION : "") }] },
-        contents,
-        generationConfig: { temperature: 0.4, maxOutputTokens: 1200 },
-      }),
-    });
-    const out = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const msg = (out.error && out.error.message) || "";
-      console.log("Gemini error", res.status, msg);
-      if (res.status === 429) return json(502, { error: "Free limit reached. Try again in a minute.", code: "rate_limit" });
-      return json(502, { error: "AI service error (" + res.status + "): " + msg.slice(0, 200), code: "upstream" });
-    }
-    const cand = out.candidates && out.candidates[0];
-    const reply = cand && cand.content && cand.content.parts ? cand.content.parts.map((p) => p.text || "").join("").trim() : "";
-    if (!reply) return json(502, { error: "The AI returned no answer. Try rephrasing.", code: "empty_reply" });
-    return json(200, { reply });
-  } catch {
-    return json(502, { error: "Could not reach the AI service.", code: "network" });
-  }
-};
+  
