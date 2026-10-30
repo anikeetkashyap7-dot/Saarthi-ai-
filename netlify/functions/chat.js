@@ -30,4 +30,70 @@ exports.handler = async (event) => {
 
   let data;
   try { data = JSON.parse(event.body || "{}"); } catch { return json(400, { error: "Invalid request.", code: "bad_json" }); }
-  
+
+  const msgs = Array.isArray(data.messages) ? data.messages.slice(-20) : [];
+  const contents = msgs
+    .filter((m) => m && (m.role === "user" || m.role === "model") && typeof m.text === "string" && m.text.trim())
+    .map((m) => ({ role: m.role, parts: [{ text: m.text.slice(0, 4000) }] }));
+  if (!contents.length || contents[contents.length - 1].role !== "user")
+    return json(400, { error: "Send a message first.", code: "empty" });
+
+  const payload = JSON.stringify({
+    systemInstruction: { parts: [{ text: BASE + (data.solution ? SOLUTION : "") }] },
+    contents,
+    generationConfig: { temperature: 0.4, maxOutputTokens: 1200 },
+  });
+
+  const started = Date.now();
+  const left = () => BUDGET_MS - (Date.now() - started);
+  let sawBusy = false;
+  let sawRateLimit = false;
+
+  outer: for (const model of MODELS) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (left() < 1500) break outer; // not enough time for another try
+
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), left());
+      let res, out;
+      try {
+        res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+          body: payload,
+          signal: ctrl.signal,
+        });
+        out = await res.json().catch(() => ({}));
+      } catch {
+        console.log("Gemini network/timeout", model);
+        break; // try next model
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (res.ok) {
+        const cand = out.candidates && out.candidates[0];
+        const reply = cand && cand.content && cand.content.parts ? cand.content.parts.map((p) => p.text || "").join("").trim() : "";
+        if (!reply) return json(502, { error: "The AI returned no answer. Try rephrasing.", code: "empty_reply" });
+        return json(200, { reply });
+      }
+
+      const msg = (out.error && out.error.message) || "";
+      console.log("Gemini error", model, res.status, msg.slice(0, 200));
+
+      if (res.status === 429) { sawRateLimit = true; break; }  // quota is per model: try next
+      if (res.status === 404) break;                           // model not available: try next
+      if (res.status === 500 || res.status === 503 || res.status === 504) {
+        sawBusy = true;
+        if (attempt === 0 && left() > 2500) { await sleep(600 + Math.random() * 400); continue; } // retry same model once
+        break;                                                  // then try next model
+      }
+      // Bad request, bad key, etc.: retrying will not help.
+      return json(502, { error: "AI service error (" + res.status + "). Please try again.", code: "upstream" });
+    }
+  }
+
+  if (sawBusy) return json(503, { error: "AI is busy right now. Please try again in a few seconds.", code: "busy" });
+  if (sawRateLimit) return json(502, { error: "Free limit reached. Try again in a minute.", code: "rate_limit" });
+  return json(502, { error: "Could not reach the AI service.", code: "network" });
+};
